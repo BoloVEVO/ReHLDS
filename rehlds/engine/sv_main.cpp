@@ -1133,7 +1133,7 @@ void SV_SendServerinfo_internal(sizebuf_t *msg, client_t *client)
 #endif
 		COM_FileBase(com_gamedir, message);
 
-	MSG_WriteString(msg, pszGameDir);
+	MSG_WriteString(msg, "");
 	MSG_WriteString(msg, Cvar_VariableString("hostname"));
 	MSG_WriteString(msg, g_psv.modelname);
 

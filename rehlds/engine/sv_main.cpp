@@ -769,6 +769,11 @@ qboolean SV_BuildSoundMsg(edict_t *entity, int channel, const char *sample, int 
 			Con_Printf("%s: %s not precached (%d)\n", __func__, sample, sound_num);
 			return FALSE;
 		}
+		sound_num = MapSoundIndex(sound_num);
+		if(!sound_num) {
+			Con_Printf("%s: %s mapped to zero!\n", __func__, sample, sound_num);
+			return FALSE;
+		}
 	}
 
 	int ent = NUM_FOR_EDICT(entity);
@@ -798,6 +803,14 @@ qboolean SV_BuildSoundMsg(edict_t *entity, int channel, const char *sample, int 
 	MSG_EndBitWriting(buffer);
 
 	return TRUE;
+}
+
+int MapSoundIndex_internal(int sound_num) {
+	return sound_num;
+}
+
+int MapSoundIndex(int sound_num) {
+	return g_RehldsHookchains.m_MapSoundIndex.callChain(MapSoundIndex_internal, sound_num);
 }
 
 int SV_HashString(const char *string, int iBounds)
@@ -831,7 +844,7 @@ int EXT_FUNC SV_LookupSoundIndex(const char *sample)
 		SV_BuildHashedSoundLookupTable();
 	}
 
-	int starting_index = SV_HashString(sample, 1023);
+	int starting_index = SV_HashString(sample, MAX_SOUNDS_HASHLOOKUP_SIZE);
 	index = starting_index;
 	while (g_psv.sound_precache_hashedlookup[index])
 	{
@@ -1127,11 +1140,17 @@ void SV_SendServerinfo_internal(sizebuf_t *msg, client_t *client)
 #ifdef REHLDS_FIXES
 	// Give the client a chance to connect in to the server with different game
 	const char *gd = Info_ValueForKey(client->userinfo, "_gd");
-	if (gd[0])
+	if(gd[0]) {
 		pszGameDir = gd;
-	else
-#endif
+	}
+	else if(client->m_sock >= NS_EXTRA) {
+		pszGameDir = extra_games[client->m_sock - NS_EXTRA];
+	} else {
 		COM_FileBase(com_gamedir, message);
+	}
+#else
+	COM_FileBase(com_gamedir, message);
+#endif		
 
 	MSG_WriteString(msg, "");
 	MSG_WriteString(msg, Cvar_VariableString("hostname"));
@@ -1232,6 +1251,12 @@ void EXT_FUNC SV_SendResources_internal(sizebuf_t *msg)
 #endif
 	for (int i = 0; i < g_psv.num_resources; i++, r++)
 	{
+		//I've changed MAX_MODELS and MAX_SOUNDS to 1024, so I better check that the clients will not know about that!
+		if((r->type == resourcetype_t::t_model || r->type == resourcetype_t::t_sound) && r->nIndex >= 512) {
+			Sys_Error("Sending a %s with index %s (must be < 512)!\n", r->type == resourcetype_t::t_model ? "model" : "sound");
+			return;
+		}
+
 		MSG_WriteBits(r->type, 4);
 		MSG_WriteBitString(r->szFileName);
 		MSG_WriteBits(r->nIndex, RESOURCE_INDEX_BITS);
@@ -1486,7 +1511,11 @@ void SV_WriteSpawn(sizebuf_t *msg)
 	NotifyDedicatedServerUI("UpdatePlayers");
 }
 
-void EXT_FUNC SV_SendUserReg(sizebuf_t *msg)
+void SV_SendUserReg(sizebuf_t *msg) {
+	g_RehldsHookchains.m_SV_SendUserReg.callChain(SV_SendUserReg_internal, msg);
+}
+
+void EXT_FUNC SV_SendUserReg_internal(sizebuf_t *msg)
 {
 	for (UserMsg *pMsg = sv_gpNewUserMsgs; pMsg; pMsg = pMsg->next)
 	{
@@ -1727,7 +1756,7 @@ void EXT_FUNC SV_RejectConnection(netadr_t *adr, char *fmt, ...)
 	MSG_WriteLong(&net_message, -1);
 	MSG_WriteByte(&net_message, '9');
 	MSG_WriteString(&net_message, text);
-	NET_SendPacket(NS_SERVER, net_message.cursize, net_message.data, *adr);
+	NET_SendPacket(net_sock, net_message.cursize, net_message.data, *adr);
 	SZ_Clear(&net_message);
 }
 
@@ -1737,7 +1766,7 @@ void SV_RejectConnectionForPassword(netadr_t *adr)
 	MSG_WriteLong(&net_message, -1);
 	MSG_WriteByte(&net_message, '8');
 	MSG_WriteString(&net_message, "BADPASSWORD");
-	NET_SendPacket(NS_SERVER, net_message.cursize, net_message.data, *adr);
+	NET_SendPacket(net_sock, net_message.cursize, net_message.data, *adr);
 	SZ_Clear(&net_message);
 }
 
@@ -2421,6 +2450,7 @@ void EXT_FUNC SV_ConnectClient_internal(void)
 		return;
 
 	host_client = client;
+	host_client->m_sock = net_sock;
 	client->userid = g_userid++;
 	if (nAuthProtocol == 3)
 	{
@@ -2452,6 +2482,7 @@ void EXT_FUNC SV_ConnectClient_internal(void)
 			host_client->network_userid.idtype = AUTH_IDTYPE_STEAM;
 			host_client->network_userid.m_SteamID = 0;
 		}
+		Steam3Server()->NotifyClientConnectExtra(client);
 	}
 	else
 	{
@@ -2491,7 +2522,7 @@ void EXT_FUNC SV_ConnectClient_internal(void)
 	if (g_modfuncs.m_pfnConnectClient)
 		g_modfuncs.m_pfnConnectClient(nClientSlot);
 
-	Netchan_Setup(NS_SERVER, &host_client->netchan, adr, client - g_psvs.clients, client, SV_GetFragmentSize);
+	Netchan_Setup(net_sock, &host_client->netchan, adr, client - g_psvs.clients, client, SV_GetFragmentSize);
 	host_client->next_messageinterval = 5.0;
 	host_client->next_messagetime = realtime + 0.05;
 	host_client->delta_sequence = -1;
@@ -2527,7 +2558,7 @@ void EXT_FUNC SV_ConnectClient_internal(void)
 #endif // REHLDS_FIXES
 
 	bIsSecure = Steam_GSBSecure();
-	Netchan_OutOfBandPrint(NS_SERVER, adr, "%c %i \"%s\" %i %i", S2C_CONNECTION, host_client->userid, NET_AdrToString(host_client->netchan.remote_address), bIsSecure, build_number()
+	Netchan_OutOfBandPrint(net_sock, adr, "%c %i \"%s\" %i %i", S2C_CONNECTION, host_client->userid, NET_AdrToString(host_client->netchan.remote_address), bIsSecure, build_number()
 #ifdef REHLDS_FIXES
 		+ 5970 // Send a fake build number greater than 5970 because the client checks for an older server build into CL_Move
 #endif
@@ -2638,7 +2669,7 @@ void SVC_GetChallenge(void)
 
 	// Give 3-rd party plugins a chance to modify challenge response
 	g_RehldsHookchains.m_SVC_GetChallenge_mod.callChain(NULL, data, challenge);
-	NET_SendPacket(NS_SERVER, Q_strlen(data) + 1, data, net_from);
+	NET_SendPacket(net_sock, Q_strlen(data) + 1, data, net_from);
 }
 
 void SVC_ServiceChallenge(void)
@@ -3899,7 +3930,7 @@ bool EXT_FUNC NET_GetPacketPreprocessor(uint8* data, unsigned int len, const net
 
 void SV_ReadPackets(void)
 {
-	while (NET_GetPacket(NS_SERVER))
+	while (num_extra_games ? NET_GetExtraPacket() : NET_GetPacket(NS_SERVER))
 	{
 #ifndef REHLDS_FIXES
 		if (SV_FilterPacket())
@@ -3926,7 +3957,7 @@ void SV_ReadPackets(void)
 				}
 #endif
 
-				Steam_HandleIncomingPacket(net_message.data, net_message.cursize, ntohl(*(u_long *)&net_from.ip[0]), htons(net_from.port));
+				CRehldsPlatformHolder::get()->SteamGameServerExtra(net_sock)->HandleIncomingPacket(net_message.data, net_message.cursize, ntohl(*(u_long*)&net_from.ip[0]), htons(net_from.port));
 				SV_ConnectionlessPacket();
 			}
 
@@ -4951,6 +4982,7 @@ void SV_WriteEntitiesToClient(client_t *client, sizebuf_t *msg)
 			}
 
 			// Prevent spam "Non-sprite set to glow!" in console on client-side
+#ifdef FIX_NSSTG_SPAM
 			if (entityState.rendermode == kRenderGlow
 				&& (entityState.modelindex >= 0 && entityState.modelindex < MAX_MODELS)
 				&& g_psv.models[entityState.modelindex]
@@ -4958,6 +4990,7 @@ void SV_WriteEntitiesToClient(client_t *client, sizebuf_t *msg)
 			{
 				entityState.rendermode = kRenderNormal;
 			}
+#endif
 		}
 		else
 		{
@@ -4993,7 +5026,15 @@ void SV_CleanupEnts(void)
 	}
 }
 
-qboolean SV_SendClientDatagram(client_t *client)
+qboolean EXT_FUNC SV_SendClientDatagram_hook(IGameClient* cl) {
+	return SV_SendClientDatagram_internal(cl->GetClient());
+}
+
+qboolean SV_SendClientDatagram(client_t* client) {
+	return g_RehldsHookchains.m_SV_SendClientDatagram.callChain(SV_SendClientDatagram_hook, GetRehldsApiClient(client));
+}
+
+qboolean SV_SendClientDatagram_internal(client_t *client)
 {
 	unsigned char buf[MAX_DATAGRAM];
 	sizebuf_t msg;
@@ -5824,12 +5865,8 @@ void SV_CreateBaseline(void)
 	edict_t *svent;
 	int entnum;
 	qboolean player;
-	qboolean custom;
-	entity_state_t nullstate;
-	delta_t *pDelta;
 
 	g_psv.instance_baselines = &g_sv_instance_baselines;
-	Q_memset(&nullstate, 0, sizeof(entity_state_t));
 	SV_FindModelNumbers();
 
 	for (entnum = 0; entnum < g_psv.num_edicts; entnum++)
@@ -5884,33 +5921,46 @@ void SV_CreateBaseline(void)
 		}
 	}
 	gEntityInterface.pfnCreateInstancedBaselines();
+	SV_WriteBaselineMessage();
+}
+
+void SV_WriteBaselineMessage() {
+	g_RehldsHookchains.m_SV_WriteBaselineMessage.callChain(SV_WriteBaselineMessage_internal);
+}
+
+void SV_WriteBaselineMessage_internal() {
+	edict_t* svent;
+	int entnum;
+	qboolean custom;
+	entity_state_t nullstate;
+	delta_t* pDelta;
+
+	Q_memset(&nullstate, 0, sizeof(entity_state_t));
+
 	MSG_WriteByte(&g_psv.signon, svc_spawnbaseline);
 	MSG_StartBitWriting(&g_psv.signon);
-	for (entnum = 0; entnum < g_psv.num_edicts; entnum++)
-	{
+	for(entnum = 0; entnum < g_psv.num_edicts; entnum++) {
 		svent = &g_psv.edicts[entnum];
-		if (!svent->free && (g_psvs.maxclients >= entnum || svent->v.modelindex))
-		{
+		if(!svent->free && (g_psvs.maxclients >= entnum || svent->v.modelindex)) {
 			MSG_WriteBits(entnum, 11);
 			MSG_WriteBits(g_psv.baselines[entnum].entityType, 2);
 			custom = ~g_psv.baselines[entnum].entityType & ENTITY_NORMAL;
-			if (custom)
+			if(custom)
 				pDelta = g_pcustomentitydelta;
-			else
-			{
+			else {
 				pDelta = g_pplayerdelta;
-				if (!SV_IsPlayerIndex(entnum))
+				if(!SV_IsPlayerIndex(entnum))
 					pDelta = g_pentitydelta;
 			}
 
-			DELTA_WriteDelta((byte *)&nullstate, (byte *)&(g_psv.baselines[entnum]), TRUE, pDelta, NULL);
+			DELTA_WriteDelta((byte*)&nullstate, (byte*)&(g_psv.baselines[entnum]), TRUE, pDelta, NULL);
 		}
 	}
 
 	MSG_WriteBits(0xFFFF, 16);
 	MSG_WriteBits(g_psv.instance_baselines->number, 6);
-	for (entnum = 0; entnum < g_psv.instance_baselines->number; entnum++)
-		DELTA_WriteDelta((byte *)&nullstate, (byte *)&(g_psv.instance_baselines->baseline[entnum]), TRUE, g_pentitydelta, NULL);
+	for(entnum = 0; entnum < g_psv.instance_baselines->number; entnum++)
+		DELTA_WriteDelta((byte*)&nullstate, (byte*)&(g_psv.instance_baselines->baseline[entnum]), TRUE, g_pentitydelta, NULL);
 
 	MSG_EndBitWriting(&g_psv.signon);
 }
@@ -6524,7 +6574,12 @@ int SV_SpawnServer(qboolean bIsDemo, char *server, char *startspot)
 	return 1;
 }
 
-void SV_LoadEntities(void)
+
+void SV_LoadEntities() {
+	g_RehldsHookchains.m_SV_LoadEntities.callChain(SV_LoadEntities_internal);
+}
+
+void SV_LoadEntities_internal(void)
 {
 #ifdef REHLDS_FIXES
 	if (sv_use_entity_file.value > 0.0f)
@@ -8026,7 +8081,7 @@ void SV_CheckCmdTimes(void)
 
 void SV_CheckForRcon(void)
 {
-	if (g_psv.active || g_pcls.state != ca_dedicated || giActive == DLL_CLOSE || !host_initialized)
+	if (g_psv.active || g_pcls.state != ca_dedicated || giActive == DLL_CLOSE || !host_initialized || num_extra_games)
 		return;
 
 	while (NET_GetPacket(NS_SERVER))
@@ -8560,6 +8615,15 @@ int GetGameAppID(void)
 	for (int i = 0; i < ARRAYSIZE(g_GameToAppIDMap); i++)
 	{
 		if (!Q_stricmp(g_GameToAppIDMap[i].pGameDir, arg))
+			return g_GameToAppIDMap[i].iAppID;
+	}
+
+	return 70;
+}
+
+int GetGameAppIDByName(const char * gameName) {
+	for(int i = 0; i < ARRAYSIZE(g_GameToAppIDMap); i++) {
+		if(!Q_stricmp(g_GameToAppIDMap[i].pGameDir, gameName))
 			return g_GameToAppIDMap[i].iAppID;
 	}
 

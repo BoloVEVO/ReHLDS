@@ -1,5 +1,13 @@
 #include "precompiled.h"
 
+#ifdef WIN32
+using dllhandle_t = HMODULE;
+#define DLL_FORMAT ".dll"
+#else
+using dllhandle_t = void*;
+#define DLL_FORMAT ".so"
+#endif
+
 IReHLDSPlatform* CRehldsPlatformHolder::m_Platform;
 
 IReHLDSPlatform* CRehldsPlatformHolder::get() {
@@ -157,8 +165,59 @@ void CSimplePlatform::SteamAPI_UseBreakpadCrashHandler(char const *pchVersion, c
 	::SteamAPI_UseBreakpadCrashHandler(pchVersion, pchDate, pchTime, bFullMemoryDumps, pvContext, m_pfnPreMinidumpCallback);
 }
 
+
+static dllhandle_t getSteamApiExtra(int iExtraGame)
+{
+	char libName[32];
+
+#ifdef _WIN32
+	snprintf(libName, sizeof(libName), "steam_api%d.dll", iExtraGame + 1);
+#else
+	snprintf(libName, sizeof(libName), "libsteam_api%d.so", iExtraGame + 1);
+#endif
+
+	auto lib = FS_LoadLibrary(libName);
+
+	if (lib)
+		return (dllhandle_t)lib;
+
+#ifdef _WIN32
+	FILE* sf = fopen("steam_api.dll", "rb");
+#else
+	FILE* sf = fopen("libsteam_api.so", "rb");
+#endif
+	if (!sf)
+		Sys_Error("Couldn't open steam_api for reading!");
+
+	FILE* tf = fopen(libName, "wb");
+	if (!tf)
+		Sys_Error("Couldn't open %s for writing!", libName);
+
+	static char buffer[8192];
+	size_t read = 0;
+	do {
+		read = fread(buffer, 1, sizeof(buffer), sf);
+		fwrite(buffer, 1, read, tf);
+	} while (read);
+
+	fclose(sf);
+	fclose(tf);
+
+	lib = FS_LoadLibrary(libName);
+
+	if (!lib)
+		Sys_Error("Couldn't load %s!", libName);
+
+	return (dllhandle_t)lib;
+}
+
 void CSimplePlatform::SteamAPI_RegisterCallback(CCallbackBase *pCallback, int iCallback) {
-	::SteamAPI_RegisterCallback(pCallback, iCallback);
+	if(num_extra_games == 0)
+		::SteamAPI_RegisterCallback(pCallback, iCallback);
+	else for(int iGame = 0; iGame < num_extra_games; iGame++) {
+		auto pfnSteamAPI_RegisterCallback = (void (*)(CCallbackBase * pCallback, int iCallback))Sys_GetProcAddress(getSteamApiExtra(iGame), "SteamAPI_RegisterCallback");
+		pfnSteamAPI_RegisterCallback(pCallback, iCallback);
+	}
 }
 
 bool CSimplePlatform::SteamAPI_Init() {
@@ -177,25 +236,121 @@ bool CSimplePlatform::SteamGameServer_Init(uint32 unIP, uint16 usSteamPort, uint
 	return ::SteamGameServer_Init(unIP, usSteamPort, usGamePort, usQueryPort, eServerMode, pchVersionString);
 }
 
+static int gExtraGame;
+static uint32 getAppIdExtra(ISteamUtils* that, const void* edx) {
+	if(gExtraGame == -1)
+		return -1;
+
+	uint32 appId = GetGameAppIDByName(extra_games[gExtraGame]);
+	gExtraGame = -1;
+	return appId;
+}
+
+bool CSimplePlatform::SteamGameServer_InitExtra(uint32 unIP, uint16 usSteamPort, uint16 usGamePort, uint16 usQueryPort, EServerMode eServerMode, const char* pchVersionString, int iExtraGame) {
+	static bool gsuHooked = false;
+	if(!gsuHooked) {
+		// do a bogus init to get the GSU instance
+		::SteamGameServer_Init(0, 0, 0, 0, EServerMode::eServerModeInvalid, 0);
+		auto gsu = SteamGameServerUtils();
+
+#ifdef _WIN32
+		auto vft = *(void***)(gsu);
+		auto pGetAppId = &vft[9];
+		DWORD oldProtect = 0;
+		VirtualProtect(pGetAppId, sizeof(*pGetAppId), PAGE_READWRITE, &oldProtect);
+		*pGetAppId = (void*)&getAppIdExtra;
+		VirtualProtect(pGetAppId, sizeof(*pGetAppId), oldProtect, &oldProtect);
+#else // LINUX
+		auto vft = *(void***)(gsu);
+		auto pGetAppId = &vft[9];
+
+		size_t pagesize = sysconf(_SC_PAGE_SIZE);
+		uintptr_t start = ((uintptr_t)pGetAppId) & ~(pagesize - 1);
+
+		mprotect((void*)start, pagesize, PROT_READ | PROT_WRITE | PROT_EXEC);
+		*pGetAppId = (void*)&getAppIdExtra;
+		mprotect((void*)start, pagesize, PROT_READ | PROT_EXEC);
+#endif
+		gsuHooked = true;
+	}
+
+	auto pfnSteamGameServer_Init = (bool(*)(uint32 unIP, uint16 usSteamPort, uint16 usGamePort, uint16 usQueryPort, EServerMode eServerMode, const char* pchVersionString))Sys_GetProcAddress(getSteamApiExtra(iExtraGame), "SteamGameServer_Init");
+
+	gExtraGame = iExtraGame;
+
+	return pfnSteamGameServer_Init(unIP, usSteamPort, usGamePort, usQueryPort, eServerMode, gpszVersionString);
+}
+
 ISteamGameServer* CSimplePlatform::SteamGameServer() {
+	if(num_extra_games)
+		Sys_Error("Unexpected use of SteamGameServer (should be SteamGameServerExtra)!");
+
 	return ::SteamGameServer();
 }
 
+ISteamGameServer* CSimplePlatform::SteamGameServerExtra(int iGame) {
+	if(iGame < 0 || iGame >= num_extra_games)
+		Sys_Error("Invalid extra game index!");
+
+	static ISteamGameServer* (*pfnSteamGameServer[MAX_EXTRA_GAMES])() = {};
+	if(!pfnSteamGameServer[iGame])
+		pfnSteamGameServer[iGame] = (ISteamGameServer*(*)())Sys_GetProcAddress(getSteamApiExtra(iGame), "SteamGameServer");
+	return pfnSteamGameServer[iGame]();
+}
+
+extern int gCurrentCallbackGame;
+
 void CSimplePlatform::SteamGameServer_RunCallbacks() {
-	::SteamGameServer_RunCallbacks();
+	if(num_extra_games == 0) {
+		::SteamGameServer_RunCallbacks();
+	}
+	else {
+		static void (*pfnSteamGameServer_RunCallbacks[MAX_EXTRA_GAMES])() = {};
+		for(int iGame = 0; iGame < num_extra_games; iGame++) {
+			if(!pfnSteamGameServer_RunCallbacks[iGame])
+				pfnSteamGameServer_RunCallbacks[iGame] = (void (*)())Sys_GetProcAddress(getSteamApiExtra(iGame), "SteamGameServer_RunCallbacks");
+
+			gCurrentCallbackGame = iGame;
+			pfnSteamGameServer_RunCallbacks[iGame]();
+		}
+		gCurrentCallbackGame = -1;
+	}
 }
 
 void CSimplePlatform::SteamAPI_RunCallbacks() {
-	::SteamAPI_RunCallbacks();
+	if(num_extra_games == 0) {
+		::SteamAPI_RunCallbacks();
+	}
+	else {
+		static void (*pfnSteamAPI_RunCallbacks[MAX_EXTRA_GAMES])() = {};
+		for(int iGame = 0; iGame < num_extra_games; iGame++) {
+			if(!pfnSteamAPI_RunCallbacks[iGame])
+				pfnSteamAPI_RunCallbacks[iGame] = (void (*)())Sys_GetProcAddress(getSteamApiExtra(iGame), "SteamAPI_RunCallbacks");
+
+			gCurrentCallbackGame = iGame;
+			pfnSteamAPI_RunCallbacks[iGame]();
+		}
+		gCurrentCallbackGame = -1;
+	}
 }
 
 void CSimplePlatform::SteamGameServer_Shutdown() {
-	::SteamGameServer_Shutdown();
+	if(num_extra_games == 0)
+		::SteamGameServer_Shutdown();
+	else for(int iGame = 0; iGame < num_extra_games; iGame++) {
+		auto pfnSteamGameServer_Shutdown = (void (*)())Sys_GetProcAddress(getSteamApiExtra(iGame), "SteamGameServer_Shutdown");
+		pfnSteamGameServer_Shutdown();
+	}
 }
 
 void CSimplePlatform::SteamAPI_UnregisterCallback(CCallbackBase *pCallback)
 {
-	::SteamAPI_UnregisterCallback(pCallback);
+	if(num_extra_games == 0)
+		::SteamAPI_UnregisterCallback(pCallback);
+	else for(int iGame = 0; iGame < num_extra_games; iGame++) {
+		auto pfnSteamAPI_UnregisterCallback = (void (*)(CCallbackBase * pCallback))Sys_GetProcAddress(getSteamApiExtra(iGame), "SteamAPI_UnregisterCallback");
+		pfnSteamAPI_UnregisterCallback(pCallback);
+	}
 }
 
 void NORETURN rehlds_syserror(const char* fmt, ...) {

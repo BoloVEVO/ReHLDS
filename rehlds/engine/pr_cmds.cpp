@@ -290,6 +290,11 @@ void EXT_FUNC PF_ambientsound_I(edict_t *entity, float *pos, const char *samp, f
 			Con_Printf("no precache: %s\n", samp);
 			return;
 		}
+		soundnum = MapSoundIndex(soundnum);
+		if(!soundnum) {
+			Con_Printf("mapped to zero: %s\n", samp);
+			return;
+		}
 	}
 
 	ent = NUM_FOR_EDICT(entity);
@@ -2025,7 +2030,7 @@ edict_t *EXT_FUNC CreateFakeClient_internal(const char *netname)
 	fakeclient->sendinfo = TRUE;
 	SV_ExtractFromUserinfo(fakeclient);
 
-	fakeclient->network_userid.m_SteamID = ISteamGameServer_CreateUnauthenticatedUserConnection();
+	fakeclient->network_userid.m_SteamID = ISteamGameServer_CreateUnauthenticatedUserConnection(fakeclient);
 	fakeclient->network_userid.idtype = AUTH_IDTYPE_STEAM;
 	ISteamGameServer_BUpdateUserData(fakeclient->network_userid.m_SteamID, netname, 0);
 

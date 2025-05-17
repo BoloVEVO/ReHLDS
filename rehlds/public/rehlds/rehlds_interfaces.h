@@ -224,6 +224,8 @@ public:
 	virtual bool IsSentNewResponse() = 0;
 	virtual void SetSentNewResponse(bool state) = 0;
 
+	virtual const char* GetGame() = 0;
+
 	// this must be the last virtual function in class
 #ifdef REHLDS_SELF
 	virtual client_t* GetClient() = 0;
@@ -244,6 +246,17 @@ public:
 
 #ifndef REHLDS_SELF
 struct client_t;
+enum GameType_e {
+	GT_Unitialized,
+	GT_CZero,
+	GT_CZeroRitual,
+	GT_TerrorStrike,
+	GT_TFC,
+	GT_HL1,
+	GT_CStrike
+};
+struct delta_s;
+struct delta_info_s;
 #endif
 
 class IRehldsServerStatic {
@@ -324,4 +337,7 @@ public:
 	virtual sizebuf_t *GetMulticastBuf() = 0;
 	virtual sizebuf_t *GetSpectatorBuf() = 0;
 	virtual sizebuf_t *GetSignonBuf() = 0;
+	virtual void SetGameType(GameType_e gameType) = 0;
+	virtual struct delta_s** GetDeltaPtr(const char* deltaName) = 0;
+	virtual struct delta_info_s* GetDeltaInfoChain() = 0;
 };

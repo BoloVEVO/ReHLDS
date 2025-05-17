@@ -30,7 +30,7 @@
 
 qboolean net_thread_initialized;
 
-loopback_t loopbacks[2];
+loopback_t loopbacks[NS_MAX];
 packetlag_t g_pLagData[NS_MAX];	// List of lag structures, if fakelag is set.
 float gFakeLag;
 int net_configured;
@@ -38,6 +38,10 @@ int net_configured;
 netadr_t net_local_ipx_adr;
 #endif
 netadr_t net_local_adr;
+netadr_t net_local_adr_extra[MAX_EXTRA_GAMES];
+int num_extra_games;
+char* extra_games[MAX_EXTRA_GAMES];
+netsrc_t net_sock;
 netadr_t net_from;
 sizebuf_t net_message;
 qboolean noip;
@@ -551,7 +555,7 @@ void NET_SendLoopPacket(netsrc_t sock, int length, void *data, const netadr_t& t
 {
 	NET_ThreadLock();
 
-	loopback_t *loop = &loopbacks[sock ^ 1];
+	loopback_t *loop = &loopbacks[sock == NS_CLIENT ? NS_SERVER : NS_CLIENT];
 
 	int i = loop->send & (MAX_LOOPBACK - 1);
 	loop->send++;
@@ -956,7 +960,7 @@ qboolean NET_QueuePacket(netsrc_t sock)
 
 #ifdef REHLDS_FIXES
 		// Only server can send split packets, there is no server<->server communication, so server can't receive split packets
-		if (sock == NS_SERVER)
+		if (sock == NS_SERVER || sock >= NS_EXTRA)
 		{
 			Con_NetPrintf("Someone tries to send split packet to the server\n");
 			continue;
@@ -1216,6 +1220,7 @@ qboolean NET_GetPacket(netsrc_t sock)
 
 	NET_AdjustLag();
 	NET_ThreadLock();
+	net_sock = sock;
 	if (NET_GetLoopPacket(sock, &in_from, &in_message))
 	{
 		bret = NET_LagPacket(TRUE, sock, &in_from, &in_message);
@@ -1256,6 +1261,13 @@ qboolean NET_GetPacket(netsrc_t sock)
 	}
 	NET_ThreadUnlock();
 	return bret;
+}
+
+qboolean NET_GetExtraPacket() {
+	for(int iGame = 0; iGame < num_extra_games; iGame++)
+		if(NET_GetPacket((netsrc_t)(NS_EXTRA + iGame)))
+			return TRUE;
+	return FALSE;
 }
 
 void NET_AllocateQueues()
@@ -1306,7 +1318,7 @@ int NET_SendLong(netsrc_t sock, SOCKET s, const char *buf, int len, int flags, c
 	static long gSequenceNumber = 1;
 
 	// Do we need to break this packet up?
-	if (sock == NS_SERVER && len > MAX_ROUTEABLE_PACKET)
+	if ((sock == NS_SERVER || sock >= NS_EXTRA) && len > MAX_ROUTEABLE_PACKET)
 	{
 		// yep
 		gSequenceNumber++;
@@ -1606,6 +1618,23 @@ void NET_OpenIP()
 			Sys_Error("%s: Couldn't allocate dedicated server IP port %d.", __func__, port);
 		}
 		sv_port = port;
+
+		for(int iGame = 0; iGame < MAX_EXTRA_GAMES; iGame++) {
+			char gameParm[] = "-sgame0";
+			gameParm[sizeof(gameParm) - 2] = '1' + iGame;
+			for(int iArg = 1; iArg < com_argc - 1; iArg++)
+				if(Q_strcmp(com_argv[iArg], gameParm) == 0)
+					extra_games[num_extra_games++] = com_argv[++iArg];
+		}
+
+		for(int iGame = 0; iGame < num_extra_games; iGame++) {
+			int port = sv_port + iGame;
+			ip_sockets[NS_EXTRA + iGame] = iGame ? NET_IPSocket(ipname.string, port, FALSE) : ip_sockets[NS_SERVER];
+
+			if(ip_sockets[NS_EXTRA + iGame] == INV_SOCK) {
+				Sys_Error("%s: Couldn't allocate dedicated server IP port %d for extra game %s.", __func__, port, extra_games[iGame]);
+			}
+		}
 	}
 
 	NET_ThreadUnlock();
@@ -1761,6 +1790,7 @@ void NET_GetLocalAddress()
 	int net_error;
 
 	Q_memset(&net_local_adr, 0, sizeof(netadr_t));
+	Q_memset(&net_local_adr_extra, 0, sizeof(net_local_adr_extra));
 
 #ifdef _WIN32
 	Q_memset(&net_local_ipx_adr, 0, sizeof(netadr_t));
@@ -1809,6 +1839,11 @@ void NET_GetLocalAddress()
 			net_local_adr.port = address.sin_port;
 			Con_Printf("Server IP address %s\n", NET_AdrToString(net_local_adr));
 			Cvar_Set("net_address", va(NET_AdrToString(net_local_adr)));
+		}
+
+		for(int iGame = 0; iGame < num_extra_games; iGame++) {
+			CRehldsPlatformHolder::get()->getsockname(ip_sockets[NS_EXTRA + iGame], (struct sockaddr*)&address, (socklen_t*)&namelen);
+			net_local_adr_extra[iGame].port = address.sin_port;
 		}
 
 #ifdef REHLDS_FIXES
@@ -1876,6 +1911,10 @@ void NET_Config(qboolean multiplayer)
 		if (!noip)
 			NET_OpenIP();
 #ifdef _WIN32
+
+		for(int iGame = 0; iGame < MAX_EXTRA_GAMES; iGame++)
+			ipx_sockets[NS_EXTRA + iGame] = INV_SOCK;
+
 		if (!noipx)
 			NET_OpenIPX();
 #endif //_WIN32

@@ -42,10 +42,13 @@ class CSteam3
 protected:
 	bool m_bLoggedOn;
 	bool m_bLogOnResult;
+	bool m_bLogOnResultExtra[MAX_EXTRA_GAMES];
 	HSteamPipe m_hSteamPipe;
 
 protected:
-	CSteam3() : m_bLoggedOn(false), m_bLogOnResult(false), m_hSteamPipe(0) {}
+	CSteam3() : m_bLoggedOn(false), m_bLogOnResult(false), m_hSteamPipe(0) {
+		memset(m_bLogOnResultExtra, false, sizeof(m_bLogOnResultExtra));
+	}
 
 	virtual ~CSteam3() {}
 	virtual void Shutdown() = 0;
@@ -97,6 +100,7 @@ public:
 	void Activate();
 	virtual void Shutdown();
 	bool NotifyClientConnect(client_t *client, const void *pvSteam2Key, uint32 ucbSteam2Key);
+	bool NotifyClientConnectExtra(client_t* client);
 	bool NotifyBotConnect(client_t *client);
 	void NotifyClientDisconnect(client_t *cl);
 	void NotifyOfLevelChange(bool bForce);
@@ -129,7 +133,7 @@ public:
 extern CSteam3Server *s_Steam3Server;
 extern CSteam3Client s_Steam3Client;
 
-uint64 ISteamGameServer_CreateUnauthenticatedUserConnection();
+uint64 ISteamGameServer_CreateUnauthenticatedUserConnection(client_t *fakeclient);
 bool ISteamGameServer_BUpdateUserData(uint64 steamid, const char *netname, uint32 score);
 bool ISteamApps_BIsSubscribedApp(uint32 appid);
 const char *Steam_GetCommunityName();
